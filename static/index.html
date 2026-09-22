@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RoleRadar — every opportunity, one search</title>
+<meta name="description" content="A live search engine for jobs, internships, freelance gigs, apprenticeships and research roles — aggregated, deduplicated and normalized from across the internet.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%2311161f' stroke='%236366f1' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='8' fill='none' stroke='%2322d3ee' stroke-width='1.5' opacity='.6'/%3E%3Cpath d='M16 16 L25 9' stroke='%236366f1' stroke-width='2.4' stroke-linecap='round'/%3E%3Ccircle cx='16' cy='16' r='2.2' fill='%2322d3ee'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- top bar -->
+  <header class="topbar">
+    <div class="logo">
+      <svg viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <circle cx="16" cy="16" r="14" stroke="#6366f1" stroke-width="2"/>
+        <circle cx="16" cy="16" r="8.5" stroke="#22d3ee" stroke-width="1.4" opacity=".55"/>
+        <circle cx="16" cy="16" r="3.5" stroke="#a5b4fc" stroke-width="1.2" opacity=".5"/>
+        <line x1="16" y1="16" x2="25.5" y2="8.5" stroke="#6366f1" stroke-width="2.4" stroke-linecap="round"/>
+        <circle cx="22" cy="11" r="1.6" fill="#22d3ee"/>
+        <circle cx="16" cy="16" r="2.1" fill="#22d3ee"/>
+      </svg>
+      <div>
+        <div class="logo-name">RoleRadar</div>
+        <div class="logo-sub">every opportunity · one search</div>
+      </div>
+    </div>
+
+    <div class="stat-chips" id="statChips">
+      <span class="stat-chip"><span class="dot" id="syncDot"></span><span id="syncLabel">connecting…</span></span>
+    </div>
+
+    <button class="icon-btn" id="refreshBtn" title="Re-crawl all sources now">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+      Sync
+    </button>
+    <button class="icon-btn" id="shareBtn" title="Copy a link to this search">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+      Share
+    </button>
+  </header>
+
+  <!-- search -->
+  <div class="searchbar">
+    <div class="search-inner">
+      <svg class="mag" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+      <input id="q" type="text" placeholder="Search every opportunity on the internet — try &quot;react intern remote&quot;, &quot;data analyst ₹12 LPA&quot;…" autocomplete="off" spellcheck="false">
+      <span class="kbd">/</span>
+      <div class="search-controls">
+        <button class="saved-toggle" id="savedToggle" title="Saved opportunities">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"><path d="M19 21l-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+          Saved <span id="savedCount"></span>
+        </button>
+        <select class="select" id="sortSel" title="Sort results">
+          <option value="newest">Newest first</option>
+          <option value="relevance">Most relevant</option>
+          <option value="salary">Highest pay</option>
+          <option value="deadline">Deadline soon</option>
+        </select>
+      </div>
+    </div>
+    <div class="result-meta" id="resultMeta"></div>
+  </div>
+
+  <!-- sources strip -->
+  <div class="sources-strip" id="sourcesStrip"></div>
+
+  <!-- layout -->
+  <div class="layout">
+    <aside class="filters" id="filters">
+      <div class="f-section" id="fType"></div>
+      <div class="f-section" id="fRemote"></div>
+      <div class="f-section" id="fLevel"></div>
+      <div class="f-section" id="fWhen"></div>
+      <div class="f-section" id="fPay"></div>
+      <div class="f-section" id="fTags"></div>
+      <div class="f-section" id="fSources"></div>
+      <div class="f-foot" id="fFoot"></div>
+    </aside>
+
+    <main class="results">
+      <div class="active-filters" id="activeFilters"></div>
+      <div id="cards"></div>
+      <div class="load-more-wrap">
+        <button class="load-more" id="loadMore" style="display:none">Load more results</button>
+      </div>
+      <div id="sentinel"></div>
+    </main>
+  </div>
+</div>
+
+<!-- mobile filter button -->
+<button class="fab" id="fabFilters">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="4" y1="6" x2="20" y2="6"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="10" y1="18" x2="14" y2="18"/></svg>
+  Filters
+</button>
+
+<!-- drawer -->
+<div class="drawer-overlay" id="drawerOverlay"></div>
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-head" id="drawerHead"></div>
+  <div class="drawer-body" id="drawerBody"></div>
+</aside>
+
+<div class="toast" id="toast"></div>
+
+<script src="/app.js" defer></script>
+</body>
+</html>
