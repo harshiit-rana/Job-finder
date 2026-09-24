@@ -2,6 +2,7 @@
 """RoleRadar — HTTP server: JSON API + static frontend (stdlib only)."""
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import mimetypes
@@ -12,6 +13,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from aggregator import config, db, pipeline, salary as salary_mod, sources
+from aggregator.classify import GEO_CODES
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +27,7 @@ VALID_TYPES = {"fulltime", "parttime", "contract", "internship", "freelance",
 VALID_REMOTE = {"remote", "hybrid", "onsite", "unknown", "flexible"}
 VALID_LEVELS = {"entry", "mid", "senior", "leadership"}
 VALID_SORT = {"newest", "relevance", "salary", "deadline"}
+GZIP_MIN_BYTES = 1024
 
 
 def parse_search_params(qs: dict) -> dict:
@@ -41,6 +44,7 @@ def parse_search_params(qs: dict) -> dict:
         "per_page": _int(qs.get("per_page"), 20),
         "types": list_param("type", VALID_TYPES),
         "remote": list_param("remote", VALID_REMOTE),
+        "geos": list_param("geo", GEO_CODES),
         "levels": list_param("level", VALID_LEVELS),
         "sources": [s for s in list_param("source") if re.fullmatch(r"[A-Za-z0-9:_\-]{1,60}", s)],
         "posted": qs.get("posted") if qs.get("posted") in db.POSTED_WINDOWS else None,
@@ -64,18 +68,29 @@ def _int(v, default):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "RoleRadar/1.0"
+    server_version = "RoleRadar/1.1"
     protocol_version = "HTTP/1.1"
 
-    # -- helpers ------------------------------------------------------------
+    # -- response helpers ---------------------------------------------------
+    def _write(self, body: bytes, ctype: str, status: int = 200,
+               cache: str = "no-store"):
+        headers = {"Content-Type": ctype, "Cache-Control": cache}
+        if (len(body) >= GZIP_MIN_BYTES
+                and "gzip" in (self.headers.get("Accept-Encoding") or "")):
+            body = gzip.compress(body, compresslevel=6)
+            headers["Content-Encoding"] = "gzip"
+            headers["Vary"] = "Accept-Encoding"
+        headers["Content-Length"] = str(len(body))
+        self.send_response(status)
+        for k, v in headers.items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
     def _send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False, default=str).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        self._write(body, "application/json; charset=utf-8", status)
 
     def _send_404(self):
         self._send_json({"error": "not found"}, 404)
@@ -84,10 +99,9 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", ""):
             path = "/index.html"
         path = path.lstrip("/")
-        # prevent path traversal
-        full = os.path.normpath(os.path.join(config.STATIC_DIR, path))
-        if not full.startswith(os.path.abspath(config.STATIC_DIR) + os.sep) and \
-           os.path.abspath(full) != os.path.join(os.path.abspath(config.STATIC_DIR), "index.html"):
+        base = os.path.abspath(config.STATIC_DIR)
+        full = os.path.normpath(os.path.join(base, path))
+        if not full.startswith(base + os.sep):
             return self._send_404()
         if not os.path.isfile(full):
             return self._send_404()
@@ -97,90 +111,89 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "application/javascript; charset=utf-8"
         with open(full, "rb") as f:
             body = f.read()
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        self._write(body, ctype, 200, "no-cache")
 
     # -- routing ------------------------------------------------------------
-    def do_GET(self):
-        try:
-            parsed = urllib.parse.urlsplit(self.path)
-            path = parsed.path.rstrip("/") or "/"
-            qs = dict(urllib.parse.parse_qsl(parsed.query))
+    def _route_get(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        qs = dict(urllib.parse.parse_qsl(parsed.query))
 
-            if path == "/api/jobs":
-                p = parse_search_params(qs)
-                result = db.search(p)
-                for job in result["results"]:
-                    if job.get("salary_text") is None:
-                        job["salary_label"] = salary_mod.format_salary(job)
-                    else:
-                        job["salary_label"] = salary_mod.format_salary(job)
-                return self._send_json(result)
-
-            m = re.fullmatch(r"/api/jobs/(\d+)", path)
-            if m:
-                job = db.get_job(int(m.group(1)))
-                if not job:
-                    return self._send_404()
+        if path == "/api/jobs":
+            p = parse_search_params(qs)
+            result = db.search(p)
+            for job in result["results"]:
                 job["salary_label"] = salary_mod.format_salary(job)
-                return self._send_json(job)
+            return self._send_json(result)
 
-            if path == "/api/stats":
-                s = db.stats()
-                s["sync"] = pipeline.sync_state()
-                return self._send_json(s)
+        m = re.fullmatch(r"/api/jobs/([0-9]+|[0-9a-f]{8,16})", path)
+        if m:
+            job = db.get_job(m.group(1))
+            if not job:
+                return self._send_404()
+            job["salary_label"] = salary_mod.format_salary(job)
+            return self._send_json(job)
 
-            if path == "/api/sources":
-                enabled = [s.info() for s in sources.enabled_sources()]
-                stats = db.stats()
-                for e in enabled:
-                    run = stats["source_runs"].get(e["name"], {})
-                    e["last_count"] = run.get("fetched")
-                    e["last_status"] = run.get("status")
-                    e["last_finished"] = run.get("finished_at")
-                    e["jobs"] = stats["by_platform"].get(e["name"], 0)
-                return self._send_json({
-                    "enabled": enabled,
-                    "disabled": sources.available_but_disabled(),
-                })
+        if path == "/api/stats":
+            s = db.stats()
+            s["sync"] = pipeline.sync_state()
+            return self._send_json(s)
 
-            if path == "/api/health":
-                return self._send_json({"status": "ok",
-                                        "sync": pipeline.sync_state()["sync_running"]})
-            if path == "/api/sync":
-                st = pipeline.sync_state()
-                st["last_sync"] = db.stats().get("last_sync")
-                return self._send_json(st)
+        if path == "/api/sources":
+            enabled = [s.info() for s in sources.enabled_sources()]
+            stats = db.stats()
+            for e in enabled:
+                run = stats["source_runs"].get(e["name"], {})
+                e["last_count"] = run.get("fetched")
+                e["last_status"] = run.get("status")
+                e["last_finished"] = run.get("finished_at")
+                e["jobs"] = stats["by_platform"].get(e["name"], 0)
+            return self._send_json({
+                "enabled": enabled,
+                "disabled": sources.available_but_disabled(),
+            })
 
-            return self._serve_static(parsed.path)
+        if path == "/api/health":
+            return self._send_json({"status": "ok",
+                                    "sync": pipeline.sync_state()["sync_running"]})
+        if path == "/api/sync":
+            st = pipeline.sync_state()
+            st["last_sync"] = db.stats().get("last_sync")
+            return self._send_json(st)
+
+        return self._serve_static(parsed.path)
+
+    def _dispatch(self):
+        try:
+            if self.command in ("GET", "HEAD"):
+                self._route_get()
+            elif self.command == "POST":
+                parsed = urllib.parse.urlsplit(self.path)
+                path = parsed.path.rstrip("/") or "/"
+                if path == "/api/refresh":
+                    threading.Thread(target=pipeline.run_refresh,
+                                     kwargs={"trigger": "manual"}, daemon=True).start()
+                    return self._send_json({"started": True, "state": pipeline.sync_state()})
+                return self._send_404()
+            else:
+                self._send_json({"error": "method not allowed"}, 405)
         except BrokenPipeError:
             pass
         except Exception as e:
-            log.exception("request failed: %s", self.path)
+            log.exception("request failed: %s %s", self.command, self.path)
             try:
                 self._send_json({"error": f"{type(e).__name__}: {e}"}, 500)
             except Exception:
                 pass
 
+    def do_GET(self):
+        self._dispatch()
+
+    def do_HEAD(self):
+        self._dispatch()
+
     def do_POST(self):
-        try:
-            parsed = urllib.parse.urlsplit(self.path)
-            path = parsed.path.rstrip("/") or "/"
-            if path == "/api/refresh":
-                threading.Thread(target=pipeline.run_refresh,
-                                 kwargs={"trigger": "manual"}, daemon=True).start()
-                return self._send_json({"started": True, "state": pipeline.sync_state()})
-            return self._send_404()
-        except BrokenPipeError:
-            pass
-        except Exception as e:
-            log.exception("POST failed")
-            self._send_json({"error": str(e)}, 500)
+        self._dispatch()
 
     def log_message(self, fmt, *args):
         msg = fmt % args

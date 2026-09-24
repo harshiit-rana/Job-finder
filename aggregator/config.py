@@ -36,19 +36,32 @@ WE_WORK_REMOTELY_CATEGORIES = [
 ]
 
 # Public Greenhouse board slugs (company career-page data via their open API).
+# All verified to return 200 with live openings.
 GREENHOUSE_BOARDS = [
+    # original
     "stripe", "coinbase", "figma", "datadog", "databricks", "cloudflare",
+    # expansion — verified working boards
+    "airbnb", "pinterest", "dropbox", "roblox", "instacart", "lyft", "twilio",
+    "okta", "gitlab", "mongodb", "reddit", "robinhood", "chime", "brex",
+    "duolingo", "discord", "elastic", "twitch", "medium", "asana", "udemy",
+    "coursera", "khanacademy", "pagerduty", "mixpanel", "newrelic",
+    "sumologic", "launchdarkly",
 ]
 
-# Public Ashby job-board slugs.
+# Public Ashby job-board slugs — verified working boards.
 ASHBY_BOARDS = [
+    # original
     "openai", "perplexity", "notion", "ramp", "cohere",
+    # expansion
+    "elevenlabs", "langchain", "temporal", "supabase", "linear", "modal",
+    "render", "encord", "causal", "brightwheel", "workos", "resend", "neon",
+    "hex", "motherduck", "dune", "nansen", "clerk", "llamaindex",
 ]
 
-# Public Lever posting slugs. Many companies migrate away from Lever, so the
-# adapter is enabled but tolerates 404s silently.
+# Public Lever posting slugs. Many companies migrated off Lever; add verified
+# slugs here — the adapter tolerates 404s silently.
 LEVER_COMPANIES = [
-    # add slugs here, e.g. "exampleco"
+    # add verified slugs here, e.g. "exampleco"
 ]
 
 # GitHub community lists of internships & new-grad roles (HTML tables in README).

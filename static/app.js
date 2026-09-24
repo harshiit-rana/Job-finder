@@ -1,16 +1,17 @@
-/* RoleRadar frontend — zero-dependency SPA */
+/* RoleRadar frontend — zero-dependency SPA
+   search · facets · full-JD drawer · application tracker (localStorage) */
 (() => {
 "use strict";
 
 /* ---------------- state ---------------- */
 const state = {
-  q: "", type: [], remote: [], level: [], sources: [],
+  q: "", type: [], remote: [], geo: [], level: [], sources: [],
   posted: "", min_salary: 0, has_salary: false, include_expired: false,
-  sort: "newest", page: 1, tag: "", savedView: false,
+  sort: "newest", page: 1, tag: "",
 };
 let sourceLabels = {};   // name -> label
 let lastFacets = {}, lastTotal = 0, loading = false, reachedEnd = false;
-const jobCache = new Map();   // fingerprint -> full job preview (for bookmarks)
+const jobCache = new Map();   // fingerprint -> job preview
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -20,7 +21,9 @@ const els = {
   sourcesStrip: $("sourcesStrip"), toast: $("toast"),
   drawer: $("drawer"), drawerOverlay: $("drawerOverlay"),
   drawerHead: $("drawerHead"), drawerBody: $("drawerBody"),
-  savedToggle: $("savedToggle"), savedCount: $("savedCount"),
+  tracker: $("tracker"), trackerOverlay: $("trackerOverlay"),
+  trackerBoard: $("trackerBoard"), trackerSub: $("trackerSub"),
+  trackerBtn: $("trackerBtn"), savedCount: $("savedCount"),
   fab: $("fabFilters"), filters: $("filters"),
 };
 
@@ -31,9 +34,16 @@ const TYPE_META = {
   research: ["Research", "b-research"], gig: ["Gig", "b-gig"], other: ["Other", "b-other"],
 };
 const REMOTE_META = { remote: "Remote", hybrid: "Hybrid", onsite: "On-site", unknown: "Unspecified" };
+const GEO_META = {
+  us: "United States", uk: "United Kingdom", eu: "Europe (EU/EEA)", in: "India",
+  ca: "Canada", worldwide_remote: "Worldwide · Remote",
+  other_remote: "Other · Remote", other: "Other / Unspecified",
+};
+const GEO_ORDER = ["us", "uk", "eu", "in", "ca", "worldwide_remote", "other_remote", "other"];
 const LEVEL_META = { entry: "Entry level", mid: "Mid level", senior: "Senior", leadership: "Leadership" };
 const POSTED_OPTS = [["", "Any time"], ["24h", "Past 24 hours"], ["3d", "Past 3 days"], ["7d", "Past week"], ["14d", "Past 2 weeks"], ["30d", "Past month"]];
 const SALARY_OPTS = [[0, "Any pay"], [40000, "$40k+"], [60000, "$60k+"], [80000, "$80k+"], [100000, "$100k+"], [150000, "$150k+"], [200000, "$200k+"]];
+const STATUSES = [["saved", "Saved"], ["applied", "Applied"], ["interviewing", "Interviewing"], ["offer", "Offer"], ["rejected", "Rejected"]];
 
 /* ---------------- utils ---------------- */
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -94,35 +104,170 @@ const ICON = {
   x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
   zap: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
   layers: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
 };
 
-/* ---------------- saved (bookmarks) ---------------- */
-const saved = {
-  get map() { try { return JSON.parse(localStorage.getItem("rr_saved") || "{}"); } catch { return {}; } },
-  has(fp) { return !!this.map[fp]; },
-  toggle(job) {
-    const m = this.map;
-    if (m[job.fingerprint]) { delete m[job.fingerprint]; toast("Removed from saved"); }
-    else { m[job.fingerprint] = job; toast("Saved — find it under the Saved toggle"); }
-    localStorage.setItem("rr_saved", JSON.stringify(m));
-    renderSavedCount();
-    document.querySelectorAll(`.bookmark[data-fp="${job.fingerprint}"]`).forEach(b => {
-      b.classList.toggle("saved", this.has(job.fingerprint));
-      b.innerHTML = this.has(job.fingerprint) ? ICON.bmf : ICON.bm;
-    });
-    if (state.savedView) renderSavedView();
+/* ---------------- application tracker ---------------- */
+const TRACKER_KEY = "rr_tracker";
+const tracker = {
+  _read() { try { return JSON.parse(localStorage.getItem(TRACKER_KEY) || "{}"); } catch { return {}; } },
+  _write(m) { localStorage.setItem(TRACKER_KEY, JSON.stringify(m)); renderTrackerCount(); },
+  all() { return this._read(); },
+  has(fp) { return !!this._read()[fp]; },
+  get(fp) { return this._read()[fp]; },
+  add(job, status = "saved") {
+    const m = this._read();
+    const prev = m[job.fingerprint] || {};
+    m[job.fingerprint] = {
+      job: { fingerprint: job.fingerprint, title: job.title, company: job.company,
+             location: job.location || "", job_type: job.job_type || "",
+             remote_mode: job.remote_mode || "", salary_label: job.salary_label || "",
+             posted_at: job.posted_at || null, apply_url: job.apply_url || job.url || "",
+             tags: job.tags || [] },
+      status: prev.status || status,
+      notes: prev.notes || "",
+      saved_at: prev.saved_at || new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    this._write(m);
   },
-  count() { return Object.keys(this.map).length; },
+  setStatus(fp, status) {
+    const m = this._read();
+    if (!m[fp]) return;
+    m[fp].status = status; m[fp].updated_at = new Date().toISOString();
+    this._write(m);
+  },
+  setNotes(fp, notes) {
+    const m = this._read();
+    if (!m[fp]) return;
+    m[fp].notes = notes; m[fp].updated_at = new Date().toISOString();
+    this._write(m);
+  },
+  remove(fp) {
+    const m = this._read();
+    if (m[fp]) { delete m[fp]; this._write(m); }
+  },
+  toggleSaved(job) {
+    if (this.has(job.fingerprint)) { this.remove(job.fingerprint); toast("Removed from tracker"); }
+    else { this.add(job, "saved"); toast("Added to tracker — set its status anytime"); }
+    syncBookmarkUI(job.fingerprint);
+  },
+  count() { return Object.keys(this._read()).length; },
 };
-function renderSavedCount() {
-  els.savedCount.textContent = saved.count() ? `(${saved.count()})` : "";
+function syncBookmarkUI(fp) {
+  const on = tracker.has(fp);
+  document.querySelectorAll(`.bookmark[data-fp="${fp}"]`).forEach(b => {
+    b.classList.toggle("saved", on);
+    b.innerHTML = on ? ICON.bmf : ICON.bm;
+  });
+  const dBtn = $("drawerBookmark");
+  if (dBtn && dBtn.dataset.fp === fp) dBtn.textContent = on ? "Saved ✓" : "Save";
+  if (els.tracker.classList.contains("open")) renderTracker();
 }
+function migrateLegacySaved() {
+  if (localStorage.getItem(TRACKER_KEY) || !localStorage.getItem("rr_saved")) return;
+  try {
+    const old = JSON.parse(localStorage.getItem("rr_saved") || "{}");
+    Object.values(old).forEach(j => { if (j && j.fingerprint) tracker.add(j, "saved"); });
+    if (Object.keys(old).length) toast(`Imported ${Object.keys(old).length} saved jobs into the tracker`);
+  } catch { /* ignore */ }
+  localStorage.removeItem("rr_saved");
+}
+function renderTrackerCount() {
+  els.savedCount.textContent = tracker.count() ? `(${tracker.count()})` : "";
+  els.trackerBtn.classList.toggle("active", tracker.count() > 0);
+}
+
+const CSV_HEADERS = ["Title", "Company", "Location", "Type", "Salary", "Status",
+                     "Notes", "Saved", "Last Update", "Apply URL"];
+function csvCell(v) {
+  v = String(v ?? "");
+  return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+}
+function exportCSV() {
+  const items = Object.values(tracker.all());
+  if (!items.length) return toast("Nothing to export yet");
+  const statusName = Object.fromEntries(STATUSES);
+  const rows = [CSV_HEADERS.join(",")];
+  items.forEach(it => {
+    const j = it.job;
+    rows.push([j.title, j.company, j.location, TYPE_META[j.job_type]?.[0] || j.job_type,
+               j.salary_label, statusName[it.status] || it.status, it.notes || "",
+               fmtDate(it.saved_at) || "", fmtDate(it.updated_at) || "", j.apply_url]
+              .map(csvCell).join(","));
+  });
+  const blob = new Blob(["﻿" + rows.join("\r\n")], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `roleradar-tracker-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  toast(`Exported ${items.length} tracked opportunities`);
+}
+
+function renderTracker() {
+  const all = tracker.all();
+  const byStatus = Object.fromEntries(STATUSES.map(([s]) => [s, []]));
+  Object.entries(all).forEach(([fp, it]) => (byStatus[it.status] ||= []).push([fp, it]));
+  for (const k of Object.keys(byStatus)) byStatus[k].sort((a, b) => (b[1].updated_at || "").localeCompare(a[1].updated_at || ""));
+
+  els.trackerSub.textContent = tracker.count()
+    ? `${tracker.count()} opportunities across ${STATUSES.filter(([s]) => byStatus[s].length).length} stages · stored locally in this browser`
+    : "your pipeline, stored locally in this browser";
+
+  els.trackerBoard.innerHTML = STATUSES.map(([status, label]) => {
+    const items = byStatus[status];
+    const body = items.length ? items.map(([fp, it]) => {
+      const j = it.job, mg = monogram(j.company);
+      return `<div class="t-card" data-fp="${esc(fp)}">
+        <div class="t-card-title" data-open="${esc(fp)}" title="Open posting">${esc(j.title)}</div>
+        <div class="t-card-co">
+          <span class="monogram" style="background:${mg.bg};width:17px;height:17px;font-size:8.5px;border-radius:5px;display:inline-flex;vertical-align:-4px;margin-right:5px">${esc(mg.initials)}</span>${esc(j.company)}
+          <span class="st-pill st-${status}" style="margin-left:6px">${label}</span>
+        </div>
+        <div class="t-card-meta">
+          ${j.location ? `<span>${esc(j.location)}</span>` : ""}
+          ${j.salary_label ? `<span>${esc(j.salary_label)}</span>` : ""}
+          <span>saved ${relTime(it.saved_at)}</span>
+        </div>
+        <select data-status-for="${esc(fp)}">
+          ${STATUSES.map(([v, l]) => `<option value="${v}" ${v === status ? "selected" : ""}>${l}</option>`).join("")}
+        </select>
+        <textarea data-notes-for="${esc(fp)}" placeholder="Notes — contacts, follow-ups, interview prep…" rows="2">${esc(it.notes || "")}</textarea>
+        <div class="t-card-foot">
+          ${j.apply_url ? `<a class="t-mini-btn" href="${esc(j.apply_url)}" target="_blank" rel="noopener noreferrer">${ICON.ext} Apply</a>` : ""}
+          <button class="t-mini-btn danger" data-remove="${esc(fp)}" style="margin-left:auto">${ICON.trash} Remove</button>
+        </div>
+      </div>`;
+    }).join("") : `<div class="t-empty">${status === "saved" ? "Bookmark opportunities and they'll land here." : "Nothing here yet."}</div>`;
+    return `<div class="t-col t-${status}">
+      <div class="t-col-head"><span class="t-dot"></span>${label}<span class="t-n">${items.length}</span></div>
+      <div class="t-col-body">${body}</div>
+    </div>`;
+  }).join("");
+
+  els.trackerBoard.querySelectorAll("select[data-status-for]").forEach(sel => {
+    sel.onchange = () => { tracker.setStatus(sel.dataset.statusFor, sel.value); renderTracker(); toast(`Moved to ${sel.options[sel.selectedIndex].text}`); };
+  });
+  els.trackerBoard.querySelectorAll("textarea[data-notes-for]").forEach(ta => {
+    ta.onchange = () => { tracker.setNotes(ta.dataset.notesFor, ta.value); };
+  });
+  els.trackerBoard.querySelectorAll("[data-remove]").forEach(btn => {
+    btn.onclick = () => { const fp = btn.dataset.remove; tracker.remove(fp); syncBookmarkUI(fp); renderTracker(); };
+  });
+  els.trackerBoard.querySelectorAll("[data-open]").forEach(el => {
+    el.onclick = () => { closeTracker(); openJob(el.dataset.open); };
+  });
+}
+function openTracker() { renderTracker(); els.tracker.classList.add("open"); els.trackerOverlay.classList.add("open"); document.body.style.overflow = "hidden"; }
+function closeTracker() { els.tracker.classList.remove("open"); els.trackerOverlay.classList.remove("open"); document.body.style.overflow = ""; }
 
 /* ---------------- URL sync ---------------- */
 function toURL() {
   const p = new URLSearchParams();
   if (state.q) p.set("q", state.q);
-  for (const [k, arr] of [["type", state.type], ["remote", state.remote], ["level", state.level], ["source", state.sources]])
+  for (const [k, arr] of [["type", state.type], ["remote", state.remote], ["geo", state.geo],
+                          ["level", state.level], ["source", state.sources]])
     if (arr.length) p.set(k, arr.join(","));
   if (state.posted) p.set("posted", state.posted);
   if (state.min_salary) p.set("min_salary", state.min_salary);
@@ -138,6 +283,7 @@ function fromURL() {
   state.q = p.get("q") || "";
   state.type = (p.get("type") || "").split(",").filter(Boolean);
   state.remote = (p.get("remote") || "").split(",").filter(Boolean);
+  state.geo = (p.get("geo") || "").split(",").filter(Boolean);
   state.level = (p.get("level") || "").split(",").filter(Boolean);
   state.sources = (p.get("source") || "").split(",").filter(Boolean);
   state.posted = p.get("posted") || "";
@@ -148,7 +294,7 @@ function fromURL() {
   state.tag = (p.get("tag") || "").toLowerCase();
   els.q.value = state.q;
   els.sortSel.value = state.sort;
-  return p.get("job");
+  return p.get("job");   // fingerprint or numeric id
 }
 
 function queryString(extra = {}) {
@@ -157,6 +303,7 @@ function queryString(extra = {}) {
   if (st.q) p.set("q", st.q);
   if (st.type.length) p.set("type", st.type.join(","));
   if (st.remote.length) p.set("remote", st.remote.join(","));
+  if (st.geo.length) p.set("geo", st.geo.join(","));
   if (st.level.length) p.set("level", st.level.join(","));
   if (st.sources.length) p.set("source", st.sources.join(","));
   if (st.posted) p.set("posted", st.posted);
@@ -191,7 +338,6 @@ async function loadResults(reset = true) {
     renderActiveChips();
     reachedEnd = data.page * data.per_page >= data.total;
     els.loadMore.style.display = reachedEnd || !data.total ? "none" : "";
-    if (state.savedView) renderSavedView();
   } catch (e) {
     if (reset) els.cards.innerHTML = emptyState("Couldn't reach the search API", String(e));
     renderMeta(null);
@@ -238,13 +384,14 @@ function remoteBadge(r) {
 function cardHTML(job) {
   const mg = monogram(job.company);
   const dl = deadlineInfo(job.deadline);
-  const isNew = job.posted_at && (Date.now() - new Date(job.posted_at)) < 86400000;
+  const isNew = job.first_seen && (Date.now() - new Date(job.first_seen)) < 86400000;
   const tags = (job.tags || []).filter(t => t && t.length < 30);
   const seenPills = [...new Set((job.sources || []).map(s => s.source))]
     .slice(0, 3).map(s => `<span class="seen-pill">${esc(shortSource(s))}</span>`).join("");
-  return `<article class="card ${job.status === "expired" ? "expired" : ""}" data-id="${job.id}" data-fp="${esc(job.fingerprint)}">
-    <button class="bookmark ${saved.has(job.fingerprint) ? "saved" : ""}" data-fp="${esc(job.fingerprint)}" title="Save">
-      ${saved.has(job.fingerprint) ? ICON.bmf : ICON.bm}
+  const tracked = tracker.has(job.fingerprint);
+  return `<article class="card ${job.status === "expired" ? "expired" : ""}" data-fp="${esc(job.fingerprint)}">
+    <button class="bookmark ${tracked ? "saved" : ""}" data-fp="${esc(job.fingerprint)}" title="Add to tracker">
+      ${tracked ? ICON.bmf : ICON.bm}
     </button>
     <div class="card-top">
       <div class="monogram" style="background:${mg.bg}">${esc(mg.initials)}</div>
@@ -302,12 +449,12 @@ function renderMeta(data) {
   if (c) c.onclick = () => { clearFilters(); loadResults(); };
 }
 function hasFilters() {
-  return !!(state.q || state.type.length || state.remote.length || state.level.length ||
-    state.sources.length || state.posted || state.min_salary || state.has_salary ||
-    state.include_expired || state.tag);
+  return !!(state.q || state.type.length || state.remote.length || state.geo.length ||
+    state.level.length || state.sources.length || state.posted || state.min_salary ||
+    state.has_salary || state.include_expired || state.tag);
 }
 function clearFilters() {
-  Object.assign(state, { q: "", type: [], remote: [], level: [], sources: [], posted: "", min_salary: 0, has_salary: false, include_expired: false, tag: "" });
+  Object.assign(state, { q: "", type: [], remote: [], geo: [], level: [], sources: [], posted: "", min_salary: 0, has_salary: false, include_expired: false, tag: "" });
   els.q.value = ""; toURL();
 }
 
@@ -325,17 +472,22 @@ function renderAllFilters() {
   const typeOrder = Object.keys(TYPE_META);
   $("fType").innerHTML = `<div class="f-title">Opportunity type</div>` +
     typeOrder.filter(t => (F.type || {})[t]).map(t =>
-      checkboxRow("type", t, TYPE_META[t][0], F.type[t], typeSw[t])).join("") || "";
+      checkboxRow("type", t, TYPE_META[t][0], F.type[t], typeSw[t])).join("");
 
   const remOrder = ["remote", "hybrid", "onsite"];
-  const remRows = remOrder.filter(r => (F.remote || {})[r]).map(r =>
-    checkboxRow("remote", r, REMOTE_META[r], F.remote[r])).join("");
-  $("fRemote").innerHTML = `<div class="f-title">Work mode</div>` + remRows;
+  $("fRemote").innerHTML = `<div class="f-title">Work mode</div>` +
+    remOrder.filter(r => (F.remote || {})[r]).map(r =>
+      checkboxRow("remote", r, REMOTE_META[r], F.remote[r])).join("");
+
+  const geoSw = { us: "#60a5fa", uk: "#f472b6", eu: "#a78bfa", in: "#fb923c", ca: "#f87171", worldwide_remote: "#2dd4bf", other_remote: "#94a3b8", other: "#64748b" };
+  $("fGeo").innerHTML = `<div class="f-title">Region</div>` +
+    GEO_ORDER.filter(g => (F.geo || {})[g]).map(g =>
+      checkboxRow("geo", g, GEO_META[g], F.geo[g], geoSw[g])).join("");
 
   const lvlOrder = ["entry", "mid", "senior", "leadership"];
-  const lvlRows = lvlOrder.filter(l => (F.level || {})[l]).map(l =>
-    checkboxRow("level", l, LEVEL_META[l], F.level[l])).join("");
-  $("fLevel").innerHTML = `<div class="f-title">Experience</div>` + lvlRows;
+  $("fLevel").innerHTML = `<div class="f-title">Experience</div>` +
+    lvlOrder.filter(l => (F.level || {})[l]).map(l =>
+      checkboxRow("level", l, LEVEL_META[l], F.level[l])).join("");
 
   $("fWhen").innerHTML = `<div class="f-title">Freshness</div>
     <select class="select f-select" id="postedSel">
@@ -385,6 +537,7 @@ function renderActiveChips() {
   if (state.tag) rm("tag", `#${state.tag}`);
   state.type.forEach(v => rm("type:" + v, TYPE_META[v]?.[0] || v));
   state.remote.forEach(v => rm("remote:" + v, REMOTE_META[v] || v));
+  state.geo.forEach(v => rm("geo:" + v, GEO_META[v] || v));
   state.level.forEach(v => rm("level:" + v, LEVEL_META[v] || v));
   state.sources.forEach(v => rm("source:" + v, prettySource(v)));
   if (state.posted) rm("posted", POSTED_OPTS.find(o => o[0] === state.posted)?.[1] || state.posted);
@@ -401,32 +554,13 @@ function renderActiveChips() {
       else if (kind === "salary") state.min_salary = 0;
       else if (kind === "has_salary") state.has_salary = false;
       else if (kind === "expired") state.include_expired = false;
-      else if (["type", "remote", "level", "source"].includes(kind)) {
+      else if (["type", "remote", "geo", "level", "source"].includes(kind)) {
         const k = kind + (kind === "source" ? "s" : "");
         state[k] = state[k].filter(x => x !== val);
       }
       toURL(); loadResults();
     };
   });
-}
-
-/* ---------------- saved view ---------------- */
-function renderSavedView() {
-  const items = Object.values(saved.map)
-    .filter(j => matchesSaved(j))
-    .sort((a, b) => (b.posted_at || "").localeCompare(a.posted_at || ""));
-  els.resultMeta.innerHTML = `<b>${items.length}</b> saved opportunit${items.length === 1 ? "y" : "ies"} <span class="sep">·</span> stored locally in your browser`;
-  els.cards.innerHTML = items.length ? items.map(cardHTML).join("")
-    : emptyState("Nothing saved yet", "Tap the bookmark on any opportunity and it will live here — even across refreshes.");
-  function matchesSaved(j) {
-    if (state.q) {
-      const hay = `${j.title} ${j.company} ${(j.tags || []).join(" ")}`.toLowerCase();
-      if (!state.q.toLowerCase().split(/\s+/).every(w => hay.includes(w))) return false;
-    }
-    if (state.type.length && !state.type.includes(j.job_type)) return false;
-    if (state.remote.length && !state.remote.includes(j.remote_mode)) return false;
-    return true;
-  }
 }
 
 /* ---------------- drawer ---------------- */
@@ -453,15 +587,15 @@ function sanitizeHTML(html) {
   return root.innerHTML;
 }
 
-async function openJob(id, push = true) {
+async function openJob(fpOrId, push = true) {
   els.drawerHead.innerHTML = `<div class="sk" style="height:22px;width:60%;margin-bottom:12px"></div><div class="sk" style="height:14px;width:35%"></div>`;
   els.drawerBody.innerHTML = `<div class="sk" style="height:110px;border-radius:12px;margin-bottom:16px"></div><div class="sk" style="height:14px;width:90%;margin-bottom:10px"></div><div class="sk" style="height:14px;width:80%;margin-bottom:10px"></div><div class="sk" style="height:14px;width:85%"></div>`;
   showDrawer();
   let job;
-  try { job = await fetchJSON(`/api/jobs/${id}`); }
+  try { job = await fetchJSON(`/api/jobs/${encodeURIComponent(fpOrId)}`); }
   catch {
     els.drawerHead.innerHTML = `<div class="d-title">Couldn't load this opportunity</div>`;
-    els.drawerBody.innerHTML = `<p class="d-loc">It may have been rotated out during a re-sync.</p>`;
+    els.drawerBody.innerHTML = `<p class="d-loc">It may have rotated out — try refreshing or hit Sync to re-crawl every source.</p>`;
     return;
   }
   const mg = monogram(job.company);
@@ -471,12 +605,13 @@ async function openJob(id, push = true) {
     ["Opportunity type", (TYPE_META[job.job_type] || [job.job_type])[0]],
     ["Experience", LEVEL_META[job.level] || "Not specified"],
     ["Location", job.location || "Not specified"],
+    ["Region", GEO_META[job.geo] || job.geo || "—"],
     ["Work mode", REMOTE_META[job.remote_mode] || job.remote_mode],
     ["Compensation", job.salary_label ? `${job.salary_label} ${job.salary_period ? "· " + periodMap[job.salary_period] : ""} ${job.salary_currency ? "· " + job.salary_currency : ""}` : "Not disclosed", !!job.salary_label],
     ["Posted", job.posted_at ? `${relTime(job.posted_at)} (${fmtDate(job.posted_at)})` : "Unknown"],
     ["Deadline", dl ? `${dl.label}${job.deadline ? " · " + fmtDate(job.deadline) : ""}` : "Not specified"],
-    ["Company", job.company],
   ];
+  const trackedNow = tracker.has(job.fingerprint);
   els.drawerHead.innerHTML = `
     <button class="drawer-close" id="drawerClose" title="Close (Esc)">${ICON.x}</button>
     <h2 class="d-title">${esc(job.title)}</h2>
@@ -494,7 +629,10 @@ async function openJob(id, push = true) {
       ${job.status !== "expired" ? `<a class="btn-primary" href="${esc(job.apply_url || job.url)}" target="_blank" rel="noopener noreferrer">Apply now ${ICON.ext}</a>` : ""}
       ${job.url ? `<a class="btn-ghost" href="${esc(job.url)}" target="_blank" rel="noopener noreferrer">Original posting ${ICON.ext}</a>` : ""}
       <button class="btn-ghost" id="copyJobLink">${ICON.link} Copy link</button>
-      <button class="btn-ghost" id="drawerBookmark">${saved.has(job.fingerprint) ? "Saved ✓" : "Save"}</button>
+      <button class="btn-ghost" id="drawerBookmark" data-fp="${esc(job.fingerprint)}">${trackedNow ? "Saved ✓" : "Save"}</button>
+      <select class="btn-ghost" id="drawerStatus" style="appearance:auto;cursor:pointer" title="Tracker status">
+        ${STATUSES.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}
+      </select>
     </div>`;
   els.drawerBody.innerHTML = `
     <div class="facts">${facts.filter(f => f[1]).map(([k, v, money]) =>
@@ -516,15 +654,28 @@ async function openJob(id, push = true) {
     : `<p>${esc(job.description_text || "No description provided by the source.").replace(/\n{2,}/g, "</p><p>").replace(/\n/g, "<br>")}</p>`;
   $("drawerClose").onclick = hideDrawer;
   $("copyJobLink").onclick = () => {
-    const u = new URL(location.href); u.searchParams.set("job", job.id);
-    navigator.clipboard?.writeText(u.toString()).then(() => toast("Link copied"));
+    const u = new URL(location.href); u.searchParams.set("job", job.fingerprint);
+    navigator.clipboard?.writeText(u.toString()).then(() => toast("Permanent link copied"));
   };
-  $("drawerBookmark").onclick = (e) => {
-    saved.toggle({ ...job, excerpt: (job.description_text || "").slice(0, 240) });
-    e.target.textContent = saved.has(job.fingerprint) ? "Saved ✓" : "Save";
+  const bookmarkBtn = $("drawerBookmark");
+  bookmarkBtn.onclick = () => {
+    tracker.toggleSaved({ ...job, excerpt: (job.description_text || "").slice(0, 240) });
+    bookmarkBtn.textContent = tracker.has(job.fingerprint) ? "Saved ✓" : "Save";
+  };
+  const statusSel = $("drawerStatus");
+  const cur = tracker.get(job.fingerprint);
+  if (cur) statusSel.value = cur.status;
+  statusSel.onchange = () => {
+    const snap = jobCache.get(job.fingerprint) || { ...job, excerpt: (job.description_text || "").slice(0, 240) };
+    tracker.add(snap, statusSel.value);
+    tracker.setStatus(job.fingerprint, statusSel.value);
+    syncBookmarkUI(job.fingerprint);
+    bookmarkBtn.textContent = "Saved ✓";
+    bookmarkBtn.classList.add("saved");
+    toast(`Tracker: moved to ${statusSel.options[statusSel.selectedIndex].text}`);
   };
   if (push) {
-    const u = new URL(location.href); u.searchParams.set("job", job.id);
+    const u = new URL(location.href); u.searchParams.set("job", job.fingerprint);
     history.replaceState(null, "", u);
   }
 }
@@ -548,9 +699,7 @@ async function loadStats() {
     const syncBusy = s.sync && s.sync.sync_running;
     els.syncDot.className = "dot" + (syncBusy ? " busy" : "");
     const ago = s.last_sync ? relTime(s.last_sync) : "never";
-    $("syncLabel").innerHTML = syncBusy
-      ? `syncing ${Object.values(s.sync.progress || {}).filter(v => v === "running").length ? "…" : ""}`
-      : `synced ${ago}`;
+    $("syncLabel").innerHTML = syncBusy ? "syncing sources…" : `synced ${ago}`;
     const chips = [
       `<b>${(s.total_active || 0).toLocaleString()}</b> live`,
       `<b>${(s.new_24h || 0).toLocaleString()}</b> new 24h`,
@@ -562,12 +711,11 @@ async function loadStats() {
     els.statChips.appendChild(existing);
     chips.forEach(h => { const el = document.createElement("span"); el.className = "stat-chip"; el.innerHTML = h; els.statChips.appendChild(el); });
 
-    // sources strip
     const runs = s.source_runs || {};
     const names = Object.keys(s.by_platform || {});
     els.sourcesStrip.innerHTML =
       `<span class="s-pill">${ICON.layers.replace("<svg", '<svg style="width:11px;height:11px"')} ${names.length} live sources</span>` +
-      names.slice(0, 24).map(n => {
+      names.slice(0, 40).map(n => {
         const r = runs[n] || {};
         return `<span class="s-pill ${r.status === "error" ? "err" : ""}" title="${esc(prettySource(n))}: ${r.fetched ?? "?"} listings fetched ${r.finished_at ? relTime(r.finished_at) : ""}"><span class="dot"></span>${esc(shortSource(n))}</span>`;
       }).join("");
@@ -586,8 +734,8 @@ async function manualRefresh() {
   btn.classList.add("spinning");
   try {
     await fetchJSON("/api/refresh", { method: "POST" });
-    toast("Re-crawling every source — this takes ~30s");
-    for (let i = 0; i < 30; i++) {
+    toast("Re-crawling every source — this takes ~1 min with 60+ boards");
+    for (let i = 0; i < 40; i++) {
       await new Promise(r => setTimeout(r, 3000));
       const st = await fetchJSON("/api/sync");
       await loadStats();
@@ -610,15 +758,14 @@ async function loadSourceLabels() {
 /* ---------------- events ---------------- */
 function bindEvents() {
   els.q.addEventListener("input", debounce(() => {
-    state.q = els.q.value.trim(); toURL();
-    if (state.savedView) renderSavedView(); else loadResults();
+    state.q = els.q.value.trim(); toURL(); loadResults();
   }, 280));
 
   els.sortSel.onchange = () => { state.sort = els.sortSel.value; toURL(); loadResults(); };
 
   els.loadMore.onclick = () => { state.page += 1; loadResults(false); };
   const io = new IntersectionObserver((entries) => {
-    if (entries[0].isIntersecting && !loading && !reachedEnd && !state.savedView && lastTotal) {
+    if (entries[0].isIntersecting && !loading && !reachedEnd && lastTotal) {
       state.page += 1; loadResults(false);
     }
   }, { rootMargin: "600px" });
@@ -636,37 +783,39 @@ function bindEvents() {
         company: card.querySelector(".company")?.textContent || "",
         tags: [], job_type: "", remote_mode: "",
       };
-      saved.toggle(jobPreview);
+      tracker.toggleSaved(jobPreview);
       return;
     }
     const card = e.target.closest(".card");
-    if (card && card.dataset.id) openJob(card.dataset.id);
+    if (card && card.dataset.fp) openJob(card.dataset.fp);
   });
   els.drawerOverlay.onclick = hideDrawer;
+  els.trackerOverlay.onclick = closeTracker;
 
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { hideDrawer(); els.filters.classList.remove("open"); }
-    if (e.key === "/" && document.activeElement !== els.q) { e.preventDefault(); els.q.focus(); }
+    if (e.key === "Escape") { hideDrawer(); closeTracker(); els.filters.classList.remove("open"); }
+    if (e.key === "/" && document.activeElement !== els.q && !els.tracker.classList.contains("open")) { e.preventDefault(); els.q.focus(); }
   });
 
   $("refreshBtn").onclick = manualRefresh;
   $("shareBtn").onclick = () => navigator.clipboard?.writeText(location.href).then(() => toast("Search link copied"));
-  els.savedToggle.onclick = () => {
-    state.savedView = !state.savedView;
-    els.savedToggle.classList.toggle("active", state.savedView);
-    if (state.savedView) renderSavedView(); else loadResults();
-  };
+  els.trackerBtn.onclick = openTracker;
+  $("trackerClose").onclick = closeTracker;
+  $("exportCsv").onclick = exportCSV;
   els.fab.onclick = () => els.filters.classList.toggle("open");
 }
 
 /* ---------------- boot ---------------- */
 (async function boot() {
   const jobParam = fromURL();
+  migrateLegacySaved();
   bindEvents();
-  renderSavedCount();
+  renderTrackerCount();
   await loadSourceLabels();
   loadStats(); pollSync();
   await loadResults();
   if (jobParam) openJob(jobParam, false);
+  // bookmark states (cards rendered before tracker migration finishes)
+  document.querySelectorAll(".card .bookmark").forEach(b => syncBookmarkUI(b.dataset.fp));
 })();
 })();

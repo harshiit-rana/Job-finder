@@ -67,12 +67,14 @@ def normalize_listing(raw: dict, *, now=None):
     level = classify.infer_level(title, job_type)
     remote_mode = classify.infer_remote_mode(
         title, location, tags, desc_text, raw.get("remote_flag"))
+    geo = classify.infer_geo(location, remote_mode, tags, desc_text)
 
     job = {
         "title": title,
         "company": company,
         "location": location,
         "remote_mode": remote_mode,
+        "geo": geo,
         "job_type": job_type,
         "level": level,
         "salary_min": sal.get("salary_min"),

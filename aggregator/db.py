@@ -1,4 +1,11 @@
-"""SQLite persistence + FTS5 search with facets."""
+"""SQLite persistence + FTS5 search with facets.
+
+Canonical jobs are keyed by their content-derived `fingerprint` (16-char hex),
+NOT by the auto-increment rowid. Rebuilds UPSERT instead of DELETE+reindex,
+so every job keeps a permanent identity forever — bookmarked ?job=<fp> links,
+saved items and tracker entries survive every 45-minute re-crawl, even full
+database rebuilds.
+"""
 from __future__ import annotations
 
 import json
@@ -16,14 +23,19 @@ log = logging.getLogger("roleradar.db")
 
 _lock = threading.Lock()
 
+SCHEMA_VERSION = 2
+
 JOB_COLUMNS = [
-    "title", "company", "location", "remote_mode", "job_type", "level",
+    "title", "company", "location", "remote_mode", "geo", "job_type", "level",
     "salary_min", "salary_max", "salary_currency", "salary_period",
     "salary_text", "usd_min", "usd_max", "tags", "posted_at", "deadline",
     "apply_url", "url", "description_text", "description_html", "sources",
     "num_sources", "fingerprint", "status", "expired_reason", "extra",
     "first_seen", "last_seen", "updated_at",
 ]
+
+# columns written on INSERT and UPDATE (fingerprint goes in the WHERE key)
+_UPSERT_COLUMNS = [c for c in JOB_COLUMNS if c != "fingerprint"]
 
 POSTED_WINDOWS = {
     "24h": timedelta(hours=24),
@@ -41,6 +53,14 @@ def get_conn() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
+
+
+def _schema_version(c: sqlite3.Connection) -> int:
+    try:
+        r = c.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        return int(r["value"]) if r else 0
+    except sqlite3.OperationalError:
+        return 0
 
 
 def init_db():
@@ -63,10 +83,20 @@ def init_db():
             started_at TEXT, finished_at TEXT,
             fetched INTEGER DEFAULT 0, status TEXT, error TEXT
         );
+        """)
+
+        if _schema_version(c) < SCHEMA_VERSION:
+            # job-row schema changed (geo column, fingerprint UNIQUE) — the cache
+            # is disposable; drop and let the next sync repopulate it.
+            log.info("schema migration: rebuilding jobs tables")
+            c.executescript("DROP TABLE IF EXISTS jobs; DROP TABLE IF EXISTS jobs_fts;")
+
+        c.executescript("""
         CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY,
             title TEXT, company TEXT, location TEXT,
-            remote_mode TEXT, job_type TEXT, level TEXT,
+            remote_mode TEXT, geo TEXT,
+            job_type TEXT, level TEXT,
             salary_min REAL, salary_max REAL, salary_currency TEXT,
             salary_period TEXT, salary_text TEXT,
             usd_min REAL, usd_max REAL,
@@ -74,7 +104,7 @@ def init_db():
             apply_url TEXT, url TEXT,
             description_text TEXT, description_html TEXT,
             sources TEXT, num_sources INTEGER DEFAULT 1,
-            fingerprint TEXT,
+            fingerprint TEXT UNIQUE,
             status TEXT DEFAULT 'active', expired_reason TEXT,
             extra TEXT,
             first_seen TEXT, last_seen TEXT, updated_at TEXT
@@ -83,16 +113,16 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_jobs_type ON jobs(job_type);
         CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
         CREATE INDEX IF NOT EXISTS idx_jobs_usd ON jobs(usd_max);
+        CREATE INDEX IF NOT EXISTS idx_jobs_geo ON jobs(geo);
+        CREATE INDEX IF NOT EXISTS idx_jobs_fp ON jobs(fingerprint);
+        CREATE VIRTUAL TABLE IF NOT EXISTS jobs_fts USING fts5(
+            title, company, location, tags, description,
+            tokenize='porter unicode61');
         """)
-
-
-def drop_and_recreate_fts(c: sqlite3.Connection):
-    c.executescript("""
-    DROP TABLE IF EXISTS jobs_fts;
-    CREATE VIRTUAL TABLE jobs_fts USING fts5(
-        title, company, location, tags, description,
-        tokenize='porter unicode61');
-    """)
+        c.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)"
+                  " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  (str(SCHEMA_VERSION),))
+        c.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -120,19 +150,60 @@ def record_run(c: sqlite3.Connection, source_name: str, platform: str,
         (source_name, platform, started_iso, util.iso(util.utcnow()), count, status, error))
 
 
+def _serialize(job: dict, cols: list[str]) -> list:
+    row = []
+    for col in cols:
+        v = job.get(col)
+        if col in ("tags", "sources", "extra"):
+            v = json.dumps(v if v is not None else ([] if col != "extra" else {}),
+                           ensure_ascii=False)
+        row.append(v)
+    return row
+
+
+def _fts_values(job: dict) -> tuple:
+    return (job.get("title") or "", job.get("company") or "",
+            job.get("location") or "", " ".join(job.get("tags") or []),
+            (job.get("description_text") or "")[:20000])
+
+
+def _expiry_for(posted_at: str | None, deadline: str | None, now_iso: str,
+                stale_before: str) -> tuple[str, str | None]:
+    if deadline and deadline < now_iso:
+        return "expired", "Application deadline passed"
+    if posted_at and posted_at < stale_before:
+        return "expired", f"Posted more than {config.STALE_AFTER_DAYS} days ago"
+    return "active", None
+
+
 def rebuild_canonical(normalized_jobs: list[dict], successful_sources: set[str] | None,
                       run_started_at, run_id: int):
-    """Deduplicate, expire stale/delisted records, swap canonical tables."""
+    """Deduplicate and UPSERT into the canonical jobs table.
+
+    IDs (rowids) are stable: a job's fingerprint maps to the same row across
+    every rebuild, so permalink URLs never break.
+    """
     now = util.utcnow()
     now_iso = util.iso(now)
+    stale_before = util.iso(now - timedelta(days=config.STALE_AFTER_DAYS))
+    hard_delete_before = util.iso(now - timedelta(days=30))
 
     jobs = dedupe.dedupe(normalized_jobs)
+    for j in jobs:
+        j["fingerprint"] = j.get("fingerprint") or dedupe.fingerprint(
+            j["company"], j["title"], j.get("location") or "")
 
-    delisted_pairs: set[tuple[str, str]] = set()
-    prev_first_seen: dict[str, str] = {}
-    prev_fp_urls: dict[str, str] = {}
+    inserted = updated = expired_now = deleted = 0
 
     with _lock, get_conn() as c:
+        existing: dict[str, sqlite3.Row] = {}
+        for r in c.execute(
+                "SELECT id, fingerprint, first_seen, last_seen, status, posted_at,"
+                " deadline, sources FROM jobs"):
+            if r["fingerprint"]:
+                existing[r["fingerprint"]] = r
+
+        delisted_pairs: set[tuple[str, str]] = set()
         if successful_sources:
             run_start_iso = util.iso(run_started_at)
             q_marks = ",".join("?" for _ in successful_sources)
@@ -144,65 +215,101 @@ def rebuild_canonical(normalized_jobs: list[dict], successful_sources: set[str] 
             c.execute(
                 f"""DELETE FROM listings WHERE last_seen < ?
                     AND first_seen < ? AND source IN ({q_marks})""",
-                [util.iso(now - timedelta(days=180)),
-                 util.iso(now - timedelta(days=180)), *successful_sources])
+                [hard_delete_before, hard_delete_before, *successful_sources])
 
-        for r in c.execute("SELECT fingerprint, first_seen, url FROM jobs"):
-            if r["fingerprint"]:
-                prev_first_seen[r["fingerprint"]] = r["first_seen"] or now_iso
+        seen_fps: set[str] = set()
+        set_clause = ",".join(f"{col}=?" for col in _UPSERT_COLUMNS)
+        ins_cols = ",".join(_UPSERT_COLUMNS + ["fingerprint"])
+        ins_ph = ",".join("?" for _ in (_UPSERT_COLUMNS + ["fingerprint"]))
 
-        active = expired = 0
         for j in jobs:
-            src_pairs = {(s.get("source"), str(s.get("source_id") or ""))
-                         for s in j.get("sources", [])}
-            status, reason = "active", None
-            dl = j.get("deadline")
-            posted = j.get("posted_at")
-            if dl and dl < now_iso:
-                status, reason = "expired", "Application deadline passed"
-            elif posted and posted < util.iso(now - timedelta(days=config.STALE_AFTER_DAYS)):
-                status, reason = "expired", f"Posted more than {config.STALE_AFTER_DAYS} days ago"
-            elif successful_sources and src_pairs and all(p in delisted_pairs for p in src_pairs):
-                status, reason = "expired", "Removed from source"
+            fp = j["fingerprint"]
+            seen_fps.add(fp)
+            status, reason = _expiry_for(j.get("posted_at"), j.get("deadline"),
+                                         now_iso, stale_before)
             j["status"], j["expired_reason"] = status, reason
-            j["fingerprint"] = j.get("fingerprint") or dedupe.fingerprint(
-                j["company"], j["title"], j.get("location") or "")
-            j["first_seen"] = prev_first_seen.get(j["fingerprint"], now_iso)
             j["last_seen"] = now_iso
             j["updated_at"] = now_iso
-            if status == "active":
-                active += 1
+
+            old = existing.get(fp)
+            if old is not None:
+                j["first_seen"] = old["first_seen"] or now_iso
+                jid = old["id"]
+                c.execute(f"UPDATE jobs SET {set_clause} WHERE id=?",
+                          _serialize(j, _UPSERT_COLUMNS) + [jid])
+                c.execute("DELETE FROM jobs_fts WHERE rowid=?", (jid,))
+                c.execute("INSERT INTO jobs_fts (rowid, title, company, location,"
+                          " tags, description) VALUES (?,?,?,?,?,?)",
+                          (jid,) + _fts_values(j))
+                updated += 1
             else:
-                expired += 1
+                j["first_seen"] = now_iso
+                cur = c.execute(
+                    f"INSERT INTO jobs ({ins_cols}) VALUES ({ins_ph})",
+                    _serialize(j, _UPSERT_COLUMNS) + [fp])
+                jid = cur.lastrowid
+                c.execute("INSERT INTO jobs_fts (rowid, title, company, location,"
+                          " tags, description) VALUES (?,?,?,?,?,?)",
+                          (jid,) + _fts_values(j))
+                inserted += 1
+            if status != "active":
+                expired_now += 1
 
-        # keep expired-but-recent for transparency; drop ancient ones
-        jobs = [j for j in jobs
-                if j["status"] == "active"
-                or (j.get("last_seen") or "") > util.iso(now - timedelta(days=30))]
+        # jobs absent from this rebuild: expire them by the stale/delisted
+        # rules, and hard-delete anything long gone.
+        for fp, old in existing.items():
+            if fp in seen_fps:
+                continue
+            status, reason = "active", None
+            try:
+                src_pairs = {(s.get("source"), str(s.get("source_id") or ""))
+                             for s in json.loads(old["sources"] or "[]")}
+            except json.JSONDecodeError:
+                src_pairs = set()
+            if old["status"] == "expired":
+                status, reason = "expired", None
+            else:
+                status, reason = _expiry_for(old["posted_at"], old["deadline"],
+                                             now_iso, stale_before)
+                if status == "active" and successful_sources and src_pairs and \
+                        all(p in delisted_pairs for p in src_pairs):
+                    status, reason = "expired", "Removed from source"
+            if status == "expired":
+                if (old["last_seen"] or "") < hard_delete_before:
+                    c.execute("DELETE FROM jobs WHERE id=?", (old["id"],))
+                    c.execute("DELETE FROM jobs_fts WHERE rowid=?", (old["id"],))
+                    deleted += 1
+                elif old["status"] != "expired":
+                    c.execute("UPDATE jobs SET status='expired', expired_reason=?,"
+                              " updated_at=? WHERE id=?",
+                              (reason or "Likely outdated", now_iso, old["id"]))
+                    expired_now += 1
+            # active stale records simply wait for their source's next run
 
-        c.execute("DELETE FROM jobs")
-        drop_and_recreate_fts(c)
-        col_sql = ",".join(JOB_COLUMNS)
-        ph = ",".join("?" for _ in JOB_COLUMNS)
-        for j in jobs:
-            row = []
-            for col in JOB_COLUMNS:
-                v = j.get(col)
-                if col in ("tags", "sources", "extra"):
-                    v = json.dumps(v or [] if col != "extra" else (v or {}), ensure_ascii=False)
-                row.append(v)
-            cur = c.execute(f"INSERT INTO jobs ({col_sql}) VALUES ({ph})", row)
-            jid = cur.lastrowid
-            c.execute(
-                "INSERT INTO jobs_fts (rowid, title, company, location, tags, description)"
-                " VALUES (?,?,?,?,?,?)",
-                (jid, j.get("title") or "", j.get("company") or "",
-                 j.get("location") or "", " ".join(j.get("tags") or []),
-                 (j.get("description_text") or "")[:20000]))
+        # FTS integrity self-heal (e.g. after a crash mid-rebuild)
+        n_jobs = c.execute("SELECT COUNT(*) n FROM jobs").fetchone()["n"]
+        n_fts = c.execute("SELECT COUNT(*) n FROM jobs_fts").fetchone()["n"]
+        if n_jobs != n_fts:
+            log.warning("FTS drift (%d jobs vs %d fts) — full reindex", n_jobs, n_fts)
+            c.execute("DELETE FROM jobs_fts")
+            for r in c.execute("SELECT id, title, company, location, tags,"
+                               " description_text FROM jobs"):
+                try:
+                    tags = " ".join(json.loads(r["tags"] or "[]"))
+                except json.JSONDecodeError:
+                    tags = ""
+                c.execute("INSERT INTO jobs_fts (rowid, title, company, location,"
+                          " tags, description) VALUES (?,?,?,?,?,?)",
+                          (r["id"], r["title"] or "", r["company"] or "",
+                           r["location"] or "", tags,
+                           (r["description_text"] or "")[:20000]))
         c.commit()
 
-    log.info("rebuild: %d canonical jobs (%d active, %d expired)", len(jobs), active, expired)
-    return {"total": len(jobs), "active": active, "expired": expired}
+    total = inserted + updated
+    log.info("rebuild: %d canonical (%d new, %d refreshed, %d expired, %d purged)",
+             total, inserted, updated, expired_now, deleted)
+    return {"total": total, "inserted": inserted, "updated": updated,
+            "expired": expired_now, "purged": deleted}
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +365,10 @@ def _filters(params, *, skip: str | None = None):
         marks = ",".join("?" for _ in params["remote"])
         where.append(f"jobs.remote_mode IN ({marks})")
         args += params["remote"]
+    if skip != "geo" and params.get("geos"):
+        marks = ",".join("?" for _ in params["geos"])
+        where.append(f"jobs.geo IN ({marks})")
+        args += params["geos"]
     if skip != "level" and params.get("levels"):
         marks = ",".join("?" for _ in params["levels"])
         where.append(f"jobs.level IN ({marks})")
@@ -306,12 +417,10 @@ def search(params: dict) -> dict:
 
     with get_conn() as c:
         fts_where = ""
-        fts_args: list = []
         rank_args: list = []
         rank_join = ""
         try:
             if fts_expr:
-                # materialize matching ids once; reuse for every facet query
                 ids = [r[0] for r in c.execute(
                     "SELECT rowid FROM jobs_fts WHERE jobs_fts MATCH ?", (fts_expr,))]
                 c.execute("CREATE TEMP TABLE IF NOT EXISTS _rr_ids (id INTEGER PRIMARY KEY)")
@@ -346,6 +455,7 @@ def search(params: dict) -> dict:
             facets = {}
             for dim, col in (("type", "jobs.job_type"),
                              ("remote", "jobs.remote_mode"),
+                             ("geo", "jobs.geo"),
                              ("level", "jobs.level")):
                 w, a = run_query(skip=dim)
                 facets[dim] = {r["k"]: r["c"] for r in c.execute(
@@ -355,7 +465,7 @@ def search(params: dict) -> dict:
             facets["sources"] = {r["k"]: r["c"] for r in c.execute(
                 f"SELECT json_extract(s.value,'$.source') k, COUNT(*) c"
                 f" FROM jobs JOIN json_each(jobs.sources) s {w}"
-                f" GROUP BY 1 ORDER BY c DESC LIMIT 40", a)}
+                f" GROUP BY 1 ORDER BY c DESC LIMIT 60", a)}
             w, a = run_query()
             facets["tags"] = [r["k"] for r in c.execute(
                 f"SELECT t.value k, COUNT(*) c FROM jobs"
@@ -404,9 +514,15 @@ def search(params: dict) -> dict:
     }
 
 
-def get_job(job_id: int) -> dict | None:
+def get_job(identifier) -> dict | None:
+    """Fetch by numeric row id OR by the permanent content fingerprint."""
+    s = str(identifier).strip()
     with get_conn() as c:
-        r = c.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if s.isdigit():
+            r = c.execute("SELECT * FROM jobs WHERE id = ?", (int(s),)).fetchone()
+        else:
+            r = c.execute("SELECT * FROM jobs WHERE fingerprint = ?",
+                          (s[:16],)).fetchone()
         return _row_to_job(r, full=True) if r else None
 
 
@@ -431,6 +547,9 @@ def stats() -> dict:
         }
         out["by_type"] = {r["k"]: r["c"] for r in c.execute(
             "SELECT job_type k, COUNT(*) c FROM jobs WHERE status='active' GROUP BY 1")}
+        out["by_geo"] = {r["k"]: r["c"] for r in c.execute(
+            "SELECT geo k, COUNT(*) c FROM jobs WHERE status='active' GROUP BY 1"
+            " ORDER BY c DESC")}
         out["by_platform"] = {r["k"]: r["c"] for r in c.execute(
             """SELECT json_extract(s.value,'$.source') k, COUNT(*) c
                FROM jobs JOIN json_each(jobs.sources) s

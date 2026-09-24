@@ -482,10 +482,27 @@ class GitHubInternships(Source):
 # ===========================================================================
 
 def _pretty(slug: str) -> str:
-    special = {"openai": "OpenAI", "notion": "Notion", "cohere": "Cohere",
-               "figma": "Figma", "databricks": "Databricks", "cloudflare": "Cloudflare",
-               "datadog": "Datadog", "stripe": "Stripe", "coinbase": "Coinbase",
-               "perplexity": "Perplexity", "ramp": "Ramp"}
+    special = {
+        "openai": "OpenAI", "notion": "Notion", "cohere": "Cohere", "figma": "Figma",
+        "databricks": "Databricks", "cloudflare": "Cloudflare", "datadog": "Datadog",
+        "stripe": "Stripe", "coinbase": "Coinbase", "perplexity": "Perplexity",
+        "ramp": "Ramp", "airbnb": "Airbnb", "pinterest": "Pinterest",
+        "dropbox": "Dropbox", "roblox": "Roblox", "instacart": "Instacart",
+        "lyft": "Lyft", "twilio": "Twilio", "okta": "Okta", "gitlab": "GitLab",
+        "mongodb": "MongoDB", "reddit": "Reddit", "robinhood": "Robinhood",
+        "chime": "Chime", "brex": "Brex", "duolingo": "Duolingo",
+        "discord": "Discord", "elastic": "Elastic", "twitch": "Twitch",
+        "medium": "Medium", "asana": "Asana", "udemy": "Udemy",
+        "coursera": "Coursera", "khanacademy": "Khan Academy",
+        "pagerduty": "PagerDuty", "mixpanel": "Mixpanel", "newrelic": "New Relic",
+        "sumologic": "Sumo Logic", "launchdarkly": "LaunchDarkly",
+        "elevenlabs": "ElevenLabs", "langchain": "LangChain", "temporal": "Temporal",
+        "supabase": "Supabase", "linear": "Linear", "modal": "Modal",
+        "render": "Render", "encord": "Encord", "causal": "Causal",
+        "brightwheel": "Brightwheel", "workos": "WorkOS", "resend": "Resend",
+        "neon": "Neon", "hex": "Hex", "motherduck": "MotherDuck", "dune": "Dune",
+        "nansen": "Nansen", "clerk": "Clerk", "llamaindex": "LlamaIndex",
+    }
     return special.get(slug, slug.replace("-", " ").replace("_", " ").title())
 
 
